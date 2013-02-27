@@ -25,24 +25,13 @@ from functools import wraps
 from urllib import quote as _quote
 from urlparse import urlparse, urlunparse
 
-try:
-    from eventlet.green.httplib import HTTPException, HTTPSConnection
-except ImportError:
-    from httplib import HTTPException, HTTPSConnection
+from httplib import HTTPException
+import httplib
 
 try:
     from eventlet import sleep
 except ImportError:
     from time import sleep
-
-try:
-    from swift.common.bufferedhttp \
-        import BufferedHTTPConnection as HTTPConnection
-except ImportError:
-    try:
-        from eventlet.green.httplib import HTTPConnection
-    except ImportError:
-        from httplib import HTTPConnection
 
 logger = logging.getLogger("swiftclient")
 
@@ -157,7 +146,6 @@ class ClientException(Exception):
                     % self.http_response_content[:60]
         return b and '%s: %s' % (a, b) or a
 
-
 def http_connection(url, proxy=None):
     """
     Make an HTTPConnection or HTTPSConnection
@@ -170,11 +158,34 @@ def http_connection(url, proxy=None):
     """
     url = encode_utf8(url)
     parsed = urlparse(url)
+    if proxy is None:
+        if parsed.scheme == 'https':
+            if 'https_proxy' in os.environ.keys():
+                proxy = os.environ['https_proxy']
+        if parsed.scheme == 'http':
+            if 'http_proxy' in os.environ.keys():
+                proxy = os.environ['http_proxy']
     proxy_parsed = urlparse(proxy) if proxy else None
     if parsed.scheme == 'http':
-        conn = HTTPConnection((proxy_parsed if proxy else parsed).netloc)
+        target = (proxy_parsed if proxy else parsed).netloc.split(':')
+        port = 80
+        if len(target) > 1:
+            port = int(target[1])
+        conn = httplib.HTTPConnection(target[0], port)
     elif parsed.scheme == 'https':
-        conn = HTTPSConnection((proxy_parsed if proxy else parsed).netloc)
+        target = (proxy_parsed if proxy else parsed).netloc.split(':')
+        port = 443
+        if len(target) > 1:
+            port = int(target[1])
+        print target[0], port
+        conn = httplib.HTTPSConnection(target[0], port)
+        if proxy:
+            target = parsed.netloc.split(':')
+            port = 443
+            if len(target) > 1:
+                port = int(target[1])
+            print target[0], port
+            conn.set_tunnel(target[0], port)
     else:
         raise ClientException('Cannot handle protocol scheme %s for url %s' %
                               (parsed.scheme, repr(url)))
@@ -197,8 +208,6 @@ def http_connection(url, proxy=None):
             func(method, url, body=body, headers=headers or {})
         return request_escaped
     conn.request = request_wrapper(conn.request)
-    if proxy:
-        conn._set_tunnel(parsed.hostname, parsed.port)
     return parsed, conn
 
 
@@ -363,7 +372,7 @@ def get_account(url, token, marker=None, limit=None, prefix=None,
     if prefix:
         qs += '&prefix=%s' % quote(prefix)
     full_path = '%s?%s' % (parsed.path, qs)
-    headers = {'X-Auth-Token': token}
+    headers = {'X-Auth-Token': token, 'Host': urlparse(url).netloc}
     method = 'GET'
     conn.request(method, full_path, '', headers)
     resp = conn.getresponse()
@@ -402,7 +411,7 @@ def head_account(url, token, http_conn=None):
     else:
         parsed, conn = http_connection(url)
     method = "HEAD"
-    headers = {'X-Auth-Token': token}
+    headers = {'X-Auth-Token': token, 'Host': urlparse(url).netloc}
     conn.request(method, parsed.path, '', headers)
     resp = conn.getresponse()
     body = resp.read()
@@ -436,6 +445,7 @@ def post_account(url, token, headers, http_conn=None):
         parsed, conn = http_connection(url)
     method = 'POST'
     headers['X-Auth-Token'] = token
+    headers['Host'] = urlparse(url).netloc
     conn.request(method, parsed.path, '', headers)
     resp = conn.getresponse()
     body = resp.read()
@@ -499,7 +509,7 @@ def get_container(url, token, container, marker=None, limit=None,
         qs += '&prefix=%s' % quote(prefix)
     if delimiter:
         qs += '&delimiter=%s' % quote(delimiter)
-    headers = {'X-Auth-Token': token}
+    headers = {'X-Auth-Token': token, 'Host': urlparse(url).netloc}
     method = 'GET'
     conn.request(method, '%s?%s' % (path, qs), '', headers)
     resp = conn.getresponse()
@@ -540,7 +550,7 @@ def head_container(url, token, container, http_conn=None, headers=None):
         parsed, conn = http_connection(url)
     path = '%s/%s' % (parsed.path, quote(container))
     method = 'HEAD'
-    req_headers = {'X-Auth-Token': token}
+    req_headers = {'X-Auth-Token': token, 'Host': urlparse(url).netloc}
     if headers:
         req_headers.update(headers)
     conn.request(method, path, '', req_headers)
@@ -582,6 +592,7 @@ def put_container(url, token, container, headers=None, http_conn=None):
     if not headers:
         headers = {}
     headers['X-Auth-Token'] = token
+    headers['Host'] = urlparse(url).netloc
     if not 'content-length' in (k.lower() for k in headers):
         headers['Content-Length'] = 0
     conn.request(method, path, '', headers)
@@ -616,6 +627,7 @@ def post_container(url, token, container, headers, http_conn=None):
     path = '%s/%s' % (parsed.path, quote(container))
     method = 'POST'
     headers['X-Auth-Token'] = token
+    headers['Host'] = urlparse(url).netloc
     if not 'content-length' in (k.lower() for k in headers):
         headers['Content-Length'] = 0
     conn.request(method, path, '', headers)
@@ -647,7 +659,7 @@ def delete_container(url, token, container, http_conn=None):
     else:
         parsed, conn = http_connection(url)
     path = '%s/%s' % (parsed.path, quote(container))
-    headers = {'X-Auth-Token': token}
+    headers = {'X-Auth-Token': token, 'Host': urlparse(url).netloc}
     method = 'DELETE'
     conn.request(method, path, '', headers)
     resp = conn.getresponse()
@@ -687,7 +699,7 @@ def get_object(url, token, container, name, http_conn=None,
         parsed, conn = http_connection(url)
     path = '%s/%s/%s' % (parsed.path, quote(container), quote(name))
     method = 'GET'
-    headers = {'X-Auth-Token': token}
+    headers = {'X-Auth-Token': token, 'Host': urlparse(url).netloc}
     conn.request(method, path, '', headers)
     resp = conn.getresponse()
     if resp.status < 200 or resp.status >= 300:
@@ -737,7 +749,7 @@ def head_object(url, token, container, name, http_conn=None):
         parsed, conn = http_connection(url)
     path = '%s/%s/%s' % (parsed.path, quote(container), quote(name))
     method = 'HEAD'
-    headers = {'X-Auth-Token': token}
+    headers = {'X-Auth-Token': token, 'Host': urlparse(url).netloc}
     conn.request(method, path, '', headers)
     resp = conn.getresponse()
     body = resp.read()
@@ -799,6 +811,7 @@ def put_object(url, token=None, container=None, name=None, contents=None,
         headers = dict(headers)
     else:
         headers = {}
+    headers['Host'] = urlparse(url).netloc
     if token:
         headers['X-Auth-Token'] = token
     if etag:
@@ -839,7 +852,7 @@ def put_object(url, token=None, container=None, name=None, contents=None,
         conn.request('PUT', path, contents, headers)
     resp = conn.getresponse()
     body = resp.read()
-    headers = {'X-Auth-Token': token}
+    headers = {'X-Auth-Token': token, 'Host': urlparse(url).netloc}
     http_log(('%s%s' % (url.replace(parsed.path, ''), path), 'PUT',),
              {'headers': headers}, resp, body)
     if resp.status < 200 or resp.status >= 300:
@@ -870,6 +883,7 @@ def post_object(url, token, container, name, headers, http_conn=None):
         parsed, conn = http_connection(url)
     path = '%s/%s/%s' % (parsed.path, quote(container), quote(name))
     headers['X-Auth-Token'] = token
+    headers['Host'] = urlparse(url).netloc
     conn.request('POST', path, '', headers)
     resp = conn.getresponse()
     body = resp.read()
@@ -916,6 +930,7 @@ def delete_object(url, token=None, container=None, name=None, http_conn=None,
         headers = {}
     if token:
         headers['X-Auth-Token'] = token
+        headers['Host'] = urlparse(url).netloc
     conn.request('DELETE', path, '', headers)
     resp = conn.getresponse()
     body = resp.read()
